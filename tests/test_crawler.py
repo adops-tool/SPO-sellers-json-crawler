@@ -91,6 +91,12 @@ class InputAndStorageTests(unittest.TestCase):
         data = {"sellers": [{"domain": "example.com"}, {"domain": 123}, {"domain": None}, {}]}
         self.assertEqual(list(crawler.extract_publishers_from_sellers(data)), ["example.com"])
 
+    def test_sellers_entry_limit_bounds_discovery_work(self):
+        body = b'{"sellers":[{}]}'
+        with patch.object(crawler, "MAX_SELLERS", 0):
+            with self.assertRaisesRegex(ValueError, "entry limit"):
+                crawler.parse_sellers_json(body)
+
     def test_retry_after_seconds_dates_and_delay_cap(self):
         config = crawler.Config(retry_backoff=0, max_retry_delay=60)
         self.assertEqual(crawler.retry_delay("0", 0, config), 0)
@@ -108,6 +114,65 @@ class InputAndStorageTests(unittest.TestCase):
                        crawler.Config(output_file=Path("same.txt"), discovered_file=Path("same.txt"), recursive=True)):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 config.validate()
+
+    def test_config_rejects_boolean_and_fractional_integers(self):
+        # range() and Queue lengths need real integers; bool is an int subclass.
+        for config in (crawler.Config(concurrency=True), crawler.Config(retries=False),
+                       crawler.Config(max_domains="10"), crawler.Config(retries=1.5),
+                       crawler.Config(max_sellers_bytes=float("inf"))):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                config.validate()
+
+    def test_parser_rejects_oversized_and_whitespace_values_cheaply(self):
+        for raw in ("a" * 5000 + ".com", "exa mple.com", "example.com/a b",
+                    "example.com/\x00", "example.com/\x7f"):
+            with self.subTest(raw=raw[:20]):
+                self.assertIsNone(crawler.clean_publisher(raw))
+                self.assertIsNone(crawler.canonical_url(raw))
+
+    def test_redirect_target_enforces_origin_rules(self):
+        current = "https://example.com/sellers.json"
+        # Same-origin hops keep the original host and port.
+        self.assertEqual(crawler.redirect_target(current, "/moved", https_only=False),
+                         "https://example.com/moved")
+        self.assertEqual(crawler.redirect_target("http://127.0.0.1:8080/a", "/b", https_only=False),
+                         "http://127.0.0.1:8080/b")
+        # Cross-origin hops must resolve to a validated public hostname.
+        self.assertEqual(crawler.redirect_target(current, "//cdn.example.org/x?y=1", https_only=False),
+                         "https://cdn.example.org/x?y=1")
+        self.assertEqual(crawler.redirect_target(current, "https://b\u00fccher.de/x", https_only=False),
+                         "https://xn--bcher-kva.de/x")
+        for location in ("http://127.0.0.1/private", "http://other.example:8443/x",
+                         "https://user:secret@example.org/x", "ftp://example.org/x",
+                         "http://example.com/x", "javascript:alert(1)"):
+            with self.subTest(location=location):
+                self.assertIsNone(crawler.redirect_target(current, location, https_only=True))
+        self.assertIsNone(crawler.redirect_target(current, "http://127.0.0.1/private", https_only=False))
+
+    def test_torn_output_line_is_reported_instead_of_aborting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.txt"
+            path.write_bytes(b"https://kept.example/sellers.json\nhttps://torn.example/sell\xffers.json")
+            with self.assertLogs("crawler", level="WARNING") as messages:
+                with crawler.LineStore(path, urls=True) as store:
+                    self.assertEqual(store.seen, {"https://kept.example/sellers.json"})
+                    self.assertEqual(store.append(["https://new.example/sellers.json"]), 1)
+            self.assertIn("invalid", messages.output[0])
+            self.assertIn(b"torn", path.read_bytes())
+
+    def test_failed_append_rolls_back_and_keeps_the_store_usable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.txt"
+            path.write_text("https://kept.example/sellers.json\n", encoding="utf-8")
+            with crawler.LineStore(path, urls=True) as store:
+                with patch("crawler.os.fsync", side_effect=OSError("Disk full")):
+                    with self.assertRaisesRegex(OSError, "Disk full"):
+                        store.append(["https://lost.example/sellers.json"])
+                self.assertEqual(path.read_text(encoding="utf-8"),
+                                 "https://kept.example/sellers.json\n")
+                self.assertEqual(store.append(["https://next.example/sellers.json"]), 1)
+            self.assertEqual(path.read_text(encoding="utf-8").splitlines(),
+                             ["https://kept.example/sellers.json", "https://next.example/sellers.json"])
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "input.txt"
             alias = Path(directory) / "output.txt"
@@ -202,6 +267,10 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
             raise web.HTTPFound("/Case/sellers.json")
         if path == "/redirect-loop":
             raise web.HTTPFound("/redirect-loop")
+        if path == "/redirect-private":
+            raise web.HTTPFound("http://127.0.0.1/steal")
+        if path == "/redirect-cross-origin":
+            raise web.HTTPFound("http://example.org/sellers.json")
         if path in {"/retry", "/rate-limit"} and self.calls[path] < 3:
             return web.Response(status=429 if path == "/rate-limit" else 503,
                                 headers={"Retry-After": "0"})
@@ -255,6 +324,18 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
     async def test_redirect_loop_is_not_retried(self):
         self.assertIsNone(await self.fetch("/redirect-loop"))
         self.assertEqual(self.stats.retries, 0)
+
+    async def test_cross_origin_redirect_is_revalidated_before_requesting_it(self):
+        # The hop resolves to an unvalidated host, so no request may be issued.
+        self.assertIsNone(await self.fetch("/redirect-private"))
+        self.assertEqual(set(self.calls), {"/redirect-private"})
+        self.assertEqual(self.stats.retries, 0)
+
+    async def test_cross_origin_redirect_to_public_host_is_allowed(self):
+        current = self.base + "/redirect-cross-origin"
+        location = "http://example.org/sellers.json"
+        self.assertIsNone(crawler.redirect_target(current, location, https_only=True))
+        self.assertEqual(crawler.redirect_target(current, location, https_only=False), location)
 
     async def test_timeout_is_bounded_and_retried(self):
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=0.02)) as session:

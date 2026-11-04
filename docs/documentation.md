@@ -44,11 +44,16 @@ without deprecated Windows event loop policy overrides.
 Every candidate starts with HTTPS and optionally falls back to HTTP. Redirects
 are bounded to five, with a timeout covering the complete chain and body.
 In HTTPS-only mode, HTTP redirects are blocked before sending a request.
+Each redirect hop is re-validated before a request is issued: same-origin hops
+keep the original host and port, while cross-origin hops must resolve to a
+validated public hostname, so credentials, IP literals, and unusual ports in a
+`Location` header are rejected.
 The resolved URL is saved without lowercasing its path.
 HTTP 200 alone is insufficient: HTML/XML media types are rejected, and JSON
 must be valid UTF-8 with a top-level object containing an array of seller
 objects. UTF-8 BOMs and empty seller lists are accepted. NaN, Infinity, malformed
-JSON, unrelated JSON, and non-object seller rows are rejected. This is structural
+JSON, unrelated JSON, and non-object seller rows are rejected, and a document
+cannot contribute more than 100,000 seller entries to discovery. This is structural
 validation, not a full compliance audit of required IAB seller fields.
 
 Bodies are read in chunks until EOF; a single `read(n)` is insufficient because
@@ -78,7 +83,11 @@ responses are rejected even if mislabeled as text/plain.
 and calls `os.fsync()` before acknowledging the append. Duplicate lines already
 present in old files are not rewritten or removed. A missing trailing newline
 is repaired before appending. Invalid historical lines are reported and ignored
-for deduplication, while their original contents are preserved.
+for deduplication, while their original contents are preserved. A torn trailing
+line with invalid UTF-8 bytes is reported instead of aborting the run, and it
+never enters the dedupe set. If a batch cannot be written or synced, the append
+is rolled back so the file keeps its previous contents and the process can
+report the storage failure.
 
 Results are cumulative and all input sites are rechecked on every run; previous
 success does not prevent current verification. Recursive discovery batches are

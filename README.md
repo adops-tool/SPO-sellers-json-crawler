@@ -5,7 +5,7 @@ An asynchronous Supply Path Optimization crawler that validates `sellers.json` e
 [![Python: 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](#prerequisites)
 [![HTTP Client: aiohttp](https://img.shields.io/badge/HTTP_Client-aiohttp-2C5BB4?style=for-the-badge)](requirements.txt)
 [![Architecture: asyncio](https://img.shields.io/badge/Architecture-asyncio-008080?style=for-the-badge)](#tech-stack--architecture)
-[![Tests: 32 Cases](https://img.shields.io/badge/Tests-32_Cases-208638?style=for-the-badge)](#testing)
+[![Tests: 40 Cases](https://img.shields.io/badge/Tests-40_Cases-208638?style=for-the-badge)](#testing)
 
 The default workflow checks an explicit site list and appends verified endpoints to `exchanges.txt`. Optional discovery modes traverse `ads.txt`, `app-ads.txt`, and `sellers[].domain` relationships without modifying the original input file.
 
@@ -99,7 +99,7 @@ SPO-Seller-pipeline-crawler/
 │   ├── instructions.md          # Operations and troubleshooting guide
 │   └── documentation.md         # Architecture and reliability notes
 └── tests/
-    └── test_crawler.py          # 32 regression tests
+    └── test_crawler.py          # 40 regression tests
 ```
 
 <details>
@@ -251,7 +251,7 @@ For a completely separate environment, create `.venv-new` and substitute that na
 
 ## Testing
 
-The current suite contains **32 tests** across three groups. Tests use temporary files, mocked failures, and ephemeral local HTTP servers; they do not require public websites or external accounts.
+The current suite contains **40 tests** across three groups. Tests use temporary files, mocked failures, and ephemeral local HTTP servers; they do not require public websites or external accounts.
 
 Run the complete suite from the project root:
 
@@ -698,6 +698,10 @@ Additional source-level settings:
 | Connect timeout | `min(10.0, timeout)` seconds; includes acquiring a pooled connection |
 | Socket-read timeout | Configured `timeout` |
 | Redirect limit | Five redirects per attempt |
+| Redirect origin rules | Same-origin hops keep host and port; cross-origin hops must be validated public hostnames |
+| Happy Eyeballs delay | `0.25` seconds before racing a second address family |
+| Maximum seller entries | `100,000` per document |
+| Maximum input value length | `2048` characters before hostname parsing |
 | Streaming chunk size | `64 * 1024` bytes |
 | Cookies | `aiohttp.DummyCookieJar`; cookies are not persisted |
 | Environment proxy support | `trust_env=True` |
