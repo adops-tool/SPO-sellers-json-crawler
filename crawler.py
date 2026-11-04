@@ -15,12 +15,13 @@ import os
 import random
 import re
 import signal
+from collections.abc import Iterable, Iterator
 from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Iterable, TextIO
+from typing import TextIO
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import aiohttp
@@ -28,9 +29,23 @@ import aiohttp
 
 PROJECT_DIR = Path(__file__).resolve().parent
 ADS_PATHS = ("/ads.txt", "/app-ads.txt")
-BAD_CONTENT_TYPES = {"text/html", "application/xhtml+xml", "application/xml", "text/xml"}
-RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
+BAD_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml", "application/xml", "text/xml"})
+RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+# Only the default port of a scheme is accepted, so a URL cannot smuggle a
+# different service into the crawl. Both maps share this single source of truth.
+DEFAULT_PORTS = {"http": 80, "https": 443}
 LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+TLD_RE = re.compile(r"(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})\Z")
+MAX_HOSTNAME_LENGTH = 253
+# Reject absurd input before the IDNA codec or the URL parser has to walk it.
+MAX_INPUT_LENGTH = 2048
+# Bound the amount of discovery work a single document can trigger.
+MAX_SELLERS = 100_000
+MAX_REDIRECTS = 5
+CHUNK_SIZE = 64 * 1024
+DEFAULT_ACCEPT = "application/json, text/plain;q=0.9, */*;q=0.1"
+ADS_ACCEPT = "text/plain, */*;q=0.1"
 USER_AGENT = "SellersJsonCrawler/2.0"
 log = logging.getLogger("crawler")
 
@@ -55,12 +70,13 @@ class Config:
     verbose: bool = False
 
     def validate(self) -> None:
-        for name in ("concurrency", "timeout", "max_sellers_bytes", "max_ads_bytes",
-                     "max_domains", "progress_interval", "max_retry_delay"):
-            value = getattr(self, name)
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"{name} must be a finite positive number.")
-        if self.retries < 0 or not math.isfinite(self.retry_backoff) or self.retry_backoff < 0:
+        for name in ("timeout", "max_sellers_bytes", "max_ads_bytes",
+                     "progress_interval", "max_retry_delay"):
+            _require_positive(name, getattr(self, name))
+        _require_integer("concurrency", self.concurrency, minimum=1)
+        _require_integer("max_domains", self.max_domains, minimum=1)
+        _require_integer("retries", self.retries, minimum=0)
+        if not _is_finite(self.retry_backoff) or self.retry_backoff < 0:
             raise ValueError("Retries and retry backoff must be non-negative.")
         # Also protect the input against collisions with generated lock files.
         paths = [self.input_file, self.output_file, lock_path(self.output_file)]
@@ -71,8 +87,13 @@ class Config:
             raise ValueError("Input, output, discovery, and lock paths must be different.")
         existing = [path for path in paths if path.exists()]
         for index, path in enumerate(existing):
-            if any(path.samefile(other) for other in existing[index + 1:]):
-                raise ValueError("Input, output, discovery, and lock files must be different.")
+            for other in existing[index + 1:]:
+                try:
+                    duplicate = path.samefile(other)
+                except OSError:  # A path vanished between exists() and samefile().
+                    duplicate = False
+                if duplicate:
+                    raise ValueError("Input, output, discovery, and lock files must be different.")
 
 
 @dataclass(frozen=True)
@@ -97,38 +118,65 @@ class Stats:
     limit_reached: bool = False
 
 
+def _is_finite(value: object) -> bool:
+    """``math.isfinite`` raises OverflowError for integers above the float range."""
+    try:
+        return math.isfinite(value)  # type: ignore[arg-type]
+    except (OverflowError, TypeError):
+        return False
+
+
+def _require_positive(name: str, value: object) -> None:
+    if not _is_finite(value) or value <= 0:  # type: ignore[operator]
+        raise ValueError(f"{name} must be a finite positive number.")
+
+
+def _require_integer(name: str, value: object, *, minimum: int) -> None:
+    """Integers must be real integers: ``bool`` and floats break ``range()`` later."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{name} must be an integer of at least {minimum}.")
+
+
 def clean_publisher(raw: object) -> str | None:
     """Normalize a public hostname, preserving www and converting IDNs to ASCII."""
     if not isinstance(raw, str):
         return None
     value = raw.strip()
-    if not value or value.startswith("#") or any(ch.isspace() for ch in value):
+    if not value or len(value) > MAX_INPUT_LENGTH or value.startswith("#"):
+        return None
+    # Whitespace and control characters could split a request line or a header.
+    if any(ch.isspace() or ch < " " or ch == "\x7f" for ch in value):
         return None
     try:
         parsed = urlsplit(value if "://" in value else "//" + value)
-        if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
+        scheme = parsed.scheme.lower()
+        if scheme and scheme not in DEFAULT_PORTS:
             return None
         if parsed.username is not None or parsed.password is not None:
             return None
-        if parsed.port is not None and parsed.port != {"http": 80, "https": 443}.get(parsed.scheme):
+        if parsed.port is not None and parsed.port != DEFAULT_PORTS.get(scheme):
             return None
         host = parsed.hostname
         if not host:
             return None
-        domain = host.rstrip(".").encode("idna").decode("ascii").lower()
-        if len(domain) > 253:
+        host = host.rstrip(".")
+        # ASCII is the common case; the IDNA codec is only needed for IDN input.
+        domain = host.lower() if host.isascii() else host.encode("idna").decode("ascii").lower()
+        if len(domain) > MAX_HOSTNAME_LENGTH:
             return None
         labels = domain.split(".")
         if len(labels) < 2 or any(not LABEL_RE.fullmatch(label) for label in labels):
             return None
-        tld = labels[-1]
-        if not (re.fullmatch(r"[a-z]{2,63}", tld) or (tld.startswith("xn--") and len(tld) > 4)):
+        if not TLD_RE.fullmatch(labels[-1]):
             return None
-        try:
-            ipaddress.ip_address(domain)
-        except ValueError:
-            return domain
-        return None
+        # Numeric hosts can only be IPv4 literals here; anything else is a domain.
+        if domain[0].isdigit():
+            try:
+                ipaddress.ip_address(domain)
+            except ValueError:
+                return domain
+            return None
+        return domain
     except (ValueError, UnicodeError):
         return None
 
@@ -144,7 +192,8 @@ def parse_target(raw: str) -> Target | None:
     domain = clean_publisher(raw)
     if domain is None:
         return None
-    parsed = urlsplit(raw.strip() if "://" in raw else "//" + raw.strip())
+    value = raw.strip()
+    parsed = urlsplit(value if "://" in value else "//" + value)
     if parsed.path.lower().endswith("/sellers.json"):
         endpoint = parsed.path
         if parsed.query:
@@ -175,7 +224,8 @@ def parse_ads_txt(body: str) -> list[str]:
     return list(domains)
 
 
-def extract_publishers_from_sellers(data: dict) -> Iterable[str]:
+def extract_publishers_from_sellers(data: dict) -> Iterator[str]:
+    """Yield normalized seller domains from an already validated document."""
     for seller in data["sellers"]:
         if isinstance(seller, dict):
             domain = clean_publisher(seller.get("domain"))
@@ -183,14 +233,23 @@ def extract_publishers_from_sellers(data: dict) -> Iterable[str]:
                 yield domain
 
 
-def parse_sellers_json(body: bytes) -> dict:
-    def reject_constant(value: str) -> None:
-        raise ValueError(f"Invalid JSON constant: {value}")
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant: {value}")
 
-    data = json.loads(body.decode("utf-8-sig"), parse_constant=reject_constant)
+
+def parse_sellers_json(body: bytes) -> dict:
+    """Validate a sellers.json document without an extra decode copy.
+
+    ``json.loads`` accepts bytes directly: it detects UTF-16/32 and UTF-8 byte
+    order marks and raises ``UnicodeDecodeError`` for invalid UTF-8.
+    """
+    data = json.loads(body, parse_constant=_reject_json_constant)
     if not isinstance(data, dict) or not isinstance(data.get("sellers"), list):
         raise ValueError("Expected a JSON object containing a sellers array.")
-    if any(not isinstance(seller, dict) for seller in data["sellers"]):
+    sellers = data["sellers"]
+    if len(sellers) > MAX_SELLERS:
+        raise ValueError(f"sellers array exceeds the {MAX_SELLERS:,} entry limit.")
+    if any(not isinstance(seller, dict) for seller in sellers):
         raise ValueError("Every sellers array entry must be an object.")
     return data
 
@@ -210,7 +269,8 @@ def load_targets(paths: Iterable[Path], max_domains: int) -> list[Target]:
                     continue
                 targets[target] = None
                 if len(targets) > max_domains:
-                    raise ValueError(f"Input exceeds the {max_domains:,} target limit; increase --max-domains.")
+                    raise ValueError(f"Input exceeds the {max_domains:,} target limit; "
+                                     "increase --max-domains.")
         if invalid:
             log.warning("Ignored %d invalid input lines in %s.", invalid, path)
     if not targets:
@@ -220,13 +280,48 @@ def load_targets(paths: Iterable[Path], max_domains: int) -> list[Target]:
 
 def canonical_url(value: str) -> str | None:
     """Normalize URL host and scheme without changing case-sensitive paths."""
+    value = value.strip()
     domain = clean_publisher(value)
     if domain is None:
         return None
-    parsed = urlsplit(value.strip())
-    if parsed.scheme.lower() not in {"http", "https"}:
+    parsed = urlsplit(value)
+    scheme = parsed.scheme.lower()
+    if scheme not in DEFAULT_PORTS:
         return None
-    return urlunsplit((parsed.scheme.lower(), domain, parsed.path or "/", parsed.query, ""))
+    return urlunsplit((scheme, domain, parsed.path or "/", parsed.query, ""))
+
+
+def redirect_target(current_url: str, location: str, *, https_only: bool) -> str | None:
+    """Resolve one redirect hop and apply the input origin rules to it.
+
+    Same-origin hops keep the current host and port verbatim, so local and
+    non-default-port deployments keep working. Cross-origin hops are rebuilt
+    from a validated public hostname, which rejects credentials, IP literals
+    and unusual ports before a request is sent to them.
+    """
+    try:
+        target = urljoin(current_url, location)
+        parsed = urlsplit(target)
+        current = urlsplit(current_url)
+        port = parsed.port
+        current_port = current.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    if scheme not in DEFAULT_PORTS or (https_only and scheme != "https"):
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    host = parsed.hostname
+    if not host:
+        return None
+    if host.lower() == (current.hostname or "").lower() and port == current_port:
+        netloc = current.netloc
+    else:
+        netloc = clean_publisher(target)
+        if netloc is None:
+            return None
+    return urlunsplit((scheme, netloc, parsed.path or "/", parsed.query, ""))
 
 
 def lock_path(path: Path) -> Path:
@@ -260,6 +355,8 @@ class OutputLock:
         return self
 
     def __exit__(self, *args) -> None:
+        # Closing the descriptor releases the OS lock; the lock file is kept to
+        # avoid re-creating it under another process.
         self.stream.close()
 
 
@@ -272,14 +369,22 @@ class LineStore:
         self.seen: set[str] = set()
         self.stream: TextIO | None = None
 
+    def _normalize(self, value: str) -> str | None:
+        # A partial trailing line can contain bytes that are not valid UTF-8.
+        if "\ufffd" in value:
+            return None
+        return canonical_url(value) if self.urls else clean_publisher(value)
+
     def __enter__(self) -> LineStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
             invalid = 0
-            with self.path.open("r", encoding="utf-8-sig") as stream:
+            # errors="replace" keeps a truncated final line from aborting the run;
+            # such a line is reported and never used for deduplication.
+            with self.path.open("r", encoding="utf-8-sig", errors="replace") as stream:
                 for line in stream:
                     value = line.strip()
-                    normalized = canonical_url(value) if self.urls else clean_publisher(value)
+                    normalized = self._normalize(value)
                     if normalized:
                         self.seen.add(normalized)
                     elif value:
@@ -304,14 +409,28 @@ class LineStore:
         return self
 
     def append(self, values: Iterable[str]) -> int:
-        fresh = list(dict.fromkeys(value for value in values if value not in self.seen))
+        fresh = [value for value in dict.fromkeys(values) if value not in self.seen]
         if not fresh:
             return 0
-        self.stream.write("".join(value + "\n" for value in fresh))
-        self.stream.flush()
-        os.fsync(self.stream.fileno())
+        offset = self.stream.tell()
+        try:
+            self.stream.write("".join(value + "\n" for value in fresh))
+            self.stream.flush()
+            os.fsync(self.stream.fileno())
+        except BaseException:
+            self._rollback(offset)
+            raise
         self.seen.update(fresh)
         return len(fresh)
+
+    def _rollback(self, offset: int) -> None:
+        """Best-effort removal of a failed batch so the previous contents survive."""
+        try:
+            self.stream.truncate(offset)
+            self.stream.seek(offset)
+            self.stream.flush()
+        except (OSError, ValueError):
+            pass
 
     def __exit__(self, *args) -> None:
         self.stream.close()
@@ -325,8 +444,8 @@ def retry_delay(header: str | None, attempt: int, config: Config) -> float:
             try:
                 date = parsedate_to_datetime(header)
                 if date.tzinfo is None:
-                    date = date.replace(tzinfo=timezone.utc)
-                delay = (date - datetime.now(timezone.utc)).total_seconds()
+                    date = date.replace(tzinfo=UTC)
+                delay = (date - datetime.now(UTC)).total_seconds()
             except (TypeError, ValueError, OverflowError):
                 delay = -1
         if math.isfinite(delay) and delay >= 0:
@@ -337,60 +456,53 @@ def retry_delay(header: str | None, attempt: int, config: Config) -> float:
 
 @asynccontextmanager
 async def open_response(session: aiohttp.ClientSession, url: str, config: Config, accept: str):
-    """Follow bounded redirects, rejecting HTTPS downgrades before issuing them."""
-    history = []
+    """Follow bounded redirects, rejecting unsafe hops before they are requested."""
+    history: list[aiohttp.RequestInfo] = []
     # The deadline includes the complete redirect chain and body consumption.
     async with asyncio.timeout(config.timeout):
-        for redirect in range(6):
+        for redirect in range(MAX_REDIRECTS + 1):
             async with session.get(url, headers={"Accept": accept}, allow_redirects=False) as response:
                 location = response.headers.get("Location") or response.headers.get("URI")
-                if response.status not in {301, 302, 303, 307, 308} or not location:
+                if response.status not in REDIRECT_STATUSES or not location:
                     yield response
                     return
-                if redirect == 5:
+                history.append(response.request_info)
+                if redirect == MAX_REDIRECTS:
                     raise aiohttp.TooManyRedirects(response.request_info, tuple(history))
-                try:
-                    next_url = urljoin(str(response.url), location)
-                    scheme = urlsplit(next_url).scheme.lower()
-                except ValueError as error:
-                    raise aiohttp.InvalidURL(location) from error
-                if scheme not in {"http", "https"} or (config.https_only and scheme != "https"):
-                    raise aiohttp.InvalidURL(next_url, "Redirect protocol is not allowed.")
-                history.append(response)
+                next_url = redirect_target(url, location, https_only=config.https_only)
+                if next_url is None:
+                    raise aiohttp.InvalidURL(location, "Redirect target is not allowed.")
                 url = next_url
 
 
 async def request_body(
     session: aiohttp.ClientSession, url: str, cap_bytes: int, config: Config, stats: Stats,
-    *, accept: str = "application/json, text/plain;q=0.9, */*;q=0.1",
+    *, accept: str = DEFAULT_ACCEPT,
 ) -> tuple[str, bytes] | None:
     for attempt in range(config.retries + 1):
-        delay = None
+        delay = 0.0
         stats.requests += 1
         try:
             async with open_response(session, url, config, accept) as response:
-                if config.https_only and (
-                    response.url.scheme != "https"
-                    or any(item.url.scheme != "https" for item in response.history)
-                ):
-                    log.debug("Rejected HTTP redirect for %s.", url)
+                if config.https_only and response.url.scheme != "https":
+                    log.debug("Rejected HTTP response for %s.", url)
                     return None
                 if response.status == 200:
                     content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
                     if content_type in BAD_CONTENT_TYPES:
                         log.debug("Rejected %s content at %s.", content_type, url)
                         return None
+                    length = response.content_length
                     if (not response.headers.get("Content-Encoding")
-                            and response.content_length is not None
-                            and response.content_length > cap_bytes):
+                            and length is not None and length > cap_bytes):
                         log.debug("Response exceeds the %d-byte limit: %s.", cap_bytes, url)
                         return None
                     body = bytearray()
-                    async for chunk in response.content.iter_chunked(64 * 1024):
+                    async for chunk in response.content.iter_chunked(CHUNK_SIZE):
                         if len(body) + len(chunk) > cap_bytes:
                             log.debug("Decoded response exceeds the %d-byte limit: %s.", cap_bytes, url)
                             return None
-                        body.extend(chunk)
+                        body += chunk
                     return str(response.url), bytes(body)
                 log.debug("HTTP %d: %s.", response.status, url)
                 if response.status not in RETRY_STATUSES or attempt == config.retries:
@@ -405,7 +517,7 @@ async def request_body(
             if attempt == config.retries:
                 return None
             delay = retry_delay(None, attempt, config)
-        # Release the response/connection before sleeping.
+        # The response and its connection are released before sleeping.
         stats.retries += 1
         await asyncio.sleep(delay)
     return None
@@ -467,7 +579,7 @@ class Crawler:
         url, data = result
         self.stats.new_urls += self.output.append([url])
         self.stats.sellers_found += 1
-        if not self.config.recursive:
+        if not self.config.recursive or self.discovered is None:
             return
         new_domains = []
         for domain in extract_publishers_from_sellers(data):
@@ -481,7 +593,7 @@ class Crawler:
         for path in ADS_PATHS:
             for url in Target(target.domain, path).urls(self.config.https_only):
                 result = await request_body(session, url, self.config.max_ads_bytes,
-                                            self.config, self.stats, accept="text/plain, */*;q=0.1")
+                                            self.config, self.stats, accept=ADS_ACCEPT)
                 if result is None:
                     continue
                 body = result[1].decode("utf-8-sig", errors="replace")
@@ -554,8 +666,11 @@ async def run(config: Config | None = None) -> Stats:
         timeout = aiohttp.ClientTimeout(total=config.timeout, connect=min(10.0, config.timeout),
                                         sock_read=config.timeout)
         # Explicit threaded DNS works on Windows without deprecated loop policies.
+        # Happy Eyeballs: a broken IPv6 route cannot stall the whole attempt.
         connector = aiohttp.TCPConnector(limit=config.concurrency, limit_per_host=2,
-                                         ttl_dns_cache=300, resolver=aiohttp.ThreadedResolver())
+                                         ttl_dns_cache=300, happy_eyeballs_delay=0.25,
+                                         enable_cleanup_closed=True,
+                                         resolver=aiohttp.ThreadedResolver())
         async with aiohttp.ClientSession(timeout=timeout, connector=connector,
                                          headers={"User-Agent": USER_AGENT},
                                          cookie_jar=aiohttp.DummyCookieJar(), trust_env=True) as session:
@@ -591,7 +706,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         for name in ("max_sellers_mb", "max_ads_mb"):
             value = getattr(args, name)
-            if not math.isfinite(value) or value <= 0:
+            if not _is_finite(value) or value <= 0:
                 raise ValueError(f"--{name.replace('_', '-')} must be finite and positive.")
         config = Config(input_file=args.input.resolve(), output_file=args.output.resolve(),
                         discovered_file=args.discovered_file.resolve(), concurrency=args.concurrency,
@@ -613,7 +728,11 @@ def main(argv: list[str] | None = None) -> int:
                 task = asyncio.current_task()
 
                 def stop(signum, frame) -> None:
-                    runner.get_loop().call_soon_threadsafe(task.cancel)
+                    # Restore the default handler so a second SIGTERM can force an exit.
+                    signal.signal(signal.SIGTERM, previous_sigterm)
+                    loop = runner.get_loop()
+                    if loop is not None and not loop.is_closed():
+                        loop.call_soon_threadsafe(task.cancel)
 
                 signal.signal(signal.SIGTERM, stop)
                 return await run(config)
